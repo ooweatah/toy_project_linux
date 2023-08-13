@@ -5,16 +5,23 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <time.h>
+#include <mqueue.h>
 
 #include <system_server.h>
 #include <gui.h>
 #include <input.h>
 #include <web_server.h>
 #include <camera_HAL.h>
+#include <toy_message.h>
 
 pthread_mutex_t system_loop_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  system_loop_cond  = PTHREAD_COND_INITIALIZER;
 bool            system_loop_exit = false;    ///< true if main loop should exit
+
+static mqd_t watchdog_queue;
+static mqd_t monitor_queue;
+static mqd_t disk_queue;
+static mqd_t camera_queue;
 
 static int toy_timer = 0;
 
@@ -49,12 +56,22 @@ int posix_sleep_ms(unsigned int timeout_ms)
 void *watchdog_thread(void* arg)
 {
     char *s = arg;
+    int mqretcode;
+    toy_msg_t msg;
 
     printf("%s", s);
-
+  
+    /* 여기에 구현하세요. */
     while (1) {
-        posix_sleep_ms(5000);
+        mqretcode = (int)mq_receive(watchdog_queue, (void *)&msg, sizeof(toy_msg_t);
+        assert(mqretcode >= 0);
+        printf("watchdog_thread: message's arrived.\n");
+        printf("msg.type: %d\n", msg.msg_type);
+        printf("msg.param1: %d\n", msg.param1);
+        printf("msg.param2: %d\n", msg.param2);
+
     }
+
 
     return 0;
 }
@@ -62,11 +79,20 @@ void *watchdog_thread(void* arg)
 void *monitor_thread(void* arg)
 {
     char *s = arg;
+    int mqretcode;
+    toy_msg_t msg;
 
     printf("%s", s);
 
+    /* 여기에 구현하세요. */
     while (1) {
-        posix_sleep_ms(5000);
+        mqretcode = (int)mq_receive(monitor_queue, (void *)&msg, sizeof(toy_msg_t), 0);
+        assert(mqretcode >= 0);
+        printf("monitor_thread: 메시지가 도착했습니다.\n");
+        printf("msg.type: %d\n", msg.msg_type);
+        printf("msg.param1: %d\n", msg.param1);
+        printf("msg.param2: %d\n", msg.param2);
+
     }
 
     return 0;
@@ -78,43 +104,51 @@ void *disk_service_thread(void* arg)
     FILE* apipe;
     char buf[1024];
     char cmd[]="df -h ./" ;
+    int mqretcode;
+    toy_msg_t msg;
 
     printf("%s", s);
 
+    /* 여기에 구현하세요. */
     while (1) {
-        /* popen 사용하여 10초마다 disk 잔여량 출력
-        
-         * popen으로 shell을 실행하면 성능과 보안 문제가 있음
-         * 향후 파일 관련 시스템 콜 시간에 개선,
-         * 하지만 가끔 빠르게 테스트 프로그램 또는 프로토 타입 시스템 작성 시 유용
-         */
-        apipe = popen(cmd,"r");
-        if(apipe == NULL ){
-            printf("popen() failed\n");
-            continue;
-        }
-        while(fgets(buf,1024,apipe) != NULL){
-            printf("%s",buf);
-        }
-        pclose(apipe);
+        mqretcode = (int)mq_receive(disk_queue, (void *)&msg, sizeof(toy_msg_t), 0);
+        assert(mqretcode >= 0);
+        printf("disk_service_thread: 메시지가 도착했습니다.\n");
+        printf("msg.type: %d\n", msg.msg_type);
+        printf("msg.param1: %d\n", msg.param1);
+        printf("msg.param2: %d\n", msg.param2);
 
-        posix_sleep_ms(10000);
     }
 
     return 0;
 }
 
+#define CAMERA_TAKE_PICTURE 1
+
 void *camera_service_thread(void* arg)
 {
     char *s = arg;
+    int mqretcode;
+    toy_msg_t msg;
 
     printf("%s", s);
 
-   toy_camera_open();
-   toy_camera_take_picture();
+    toy_camera_open();
 
+    /* 여기에 구현하세요. */
     while (1) {
-        posix_sleep_ms(5000);
+    
+    	mqretcode = (int)mq_receive(camera_queue, (void *)&msg, sizeof(toy_msg_t), 0);
+        assert(mqretcode >= 0);
+        printf("camera_service_thread: 메시지가 도착했습니다.\n");
+        printf("msg.type: %d\n", msg.msg_type);
+        printf("msg.param1: %d\n", msg.param1);
+        printf("msg.param2: %d\n", msg.param2);
+        if (msg.msg_type == CAMERA_TAKE_PICTURE) {
+            toy_camera_take_picture();
+        }
+
+
     }
 
     return 0;
@@ -144,6 +178,18 @@ int system_server()
     /* 10초 타이머 등록 */
     set_periodic_timer(10, 0);
 
+    /* 여기에 구현하세요. */
+    /* 메시지 큐를 오픈한다. */
+    watchdog_queue = mq_open("/watchdog_queue", O_RDWR);
+    assert(watchdog_queue != -1);
+    monitor_queue = mq_open("/monitor_queue", O_RDWR);
+    assert(monitor_queue != -1);
+    disk_queue = mq_open("/disk_queue", O_RDWR);
+    assert(disk_queue != -1);
+    camera_queue = mq_open("/camera_queue", O_RDWR);
+    assert(camera_queue != -1);
+
+
     /* 스레드를 생성한다. */
     retcode = pthread_create(&watchdog_thread_tid, NULL, watchdog_thread, "watchdog thread\n");
     assert(retcode == 0);
@@ -156,7 +202,6 @@ int system_server()
 
     printf("system init done.  waiting...");
 
-    // 여기에 구현하세요... 여기서 cond wait로 대기한다. 10초 후 알람이 울리면 <== system 출력
     pthread_mutex_lock(&system_loop_mutex);
     while (system_loop_exit == false) {
         pthread_cond_wait(&system_loop_cond, &system_loop_mutex);
@@ -164,10 +209,6 @@ int system_server()
     pthread_mutex_unlock(&system_loop_mutex);
 
     printf("<== system\n");
-    // /* 1초 마다 wake-up 한다 */
-    while (system_loop_exit == false) {
-        sleep(1);
-    }
 
     while (1) {
         sleep(1);
