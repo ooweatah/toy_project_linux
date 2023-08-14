@@ -1,1 +1,7 @@
+# Backup Folder
 backup/
+
+# Object Files
+*.o
+*.ko
+
