@@ -79,12 +79,26 @@ void segfault_handler(int sig_num, siginfo_t * info, void * ucontext) {
  */
 void *sensor_thread(void* arg)
 {
+	int mqretcode;
     char *s = arg;
+	toy_msg_t msg;
+	int shmid = toy_shm_get_keyid(SHM_KEY_SENSOR); // 키 얻음
 
     printf("%s", s);
 
     while (1) {
         posix_sleep_ms(5000);
+		if (the_sensor_info != NULL) {
+            the_sensor_info->temp = 35;
+            the_sensor_info->press = 55;
+            the_sensor_info->humidity = 80;
+        }
+		msg.msg_type = 1;
+        msg.param1 = shmid; // 파라미터 1 = id
+        msg.param2 = 0;
+        mqretcode = mq_send(monitor_queue, (char *)&msg, sizeof(msg), 0); // 모니터큐에 메시지 보내기
+        assert(mqretcode == 0);
+
     }
 
     return 0;
