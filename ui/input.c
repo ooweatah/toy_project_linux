@@ -33,6 +33,7 @@ typedef struct _sig_ucontext {
 
 static pthread_mutex_t global_message_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static char global_message[TOY_BUFFSIZE];
+static shm_sensor_t *the_sensor_info =NULL;
 
 static mqd_t watchdog_queue;
 static mqd_t monitor_queue;
@@ -310,8 +311,13 @@ int input()
     sa.sa_flags = SA_RESTART | SA_SIGINFO;
     sa.sa_sigaction = segfault_handler;
 
-    sigaction(SIGSEGV, &sa, NULL); /* ignore whether it works or not */
 
+    sigaction(SIGSEGV, &sa, NULL); /* ignore whether it works or not */
+	
+	the_sensor_info= (shm_sensor_t *)toy_shm_create(SHM_KEY_SENSOR, sizeof(shm_sensor_t));
+	if( the_sensor_info = (void *)-1 ) {
+		the_sensor_info = NULL;
+		printf("Error in shm_create SHMID=%d SHD_KEY_SENSOR\n", SHM_KEY_SENSOR);
     /* 메시지 큐를 오픈 한다.
      * 하지만, 사실 fork로 생성했기 때문에 파일 디스크립터 공유되었음. 따따서, extern으로 사용 가능
     */
