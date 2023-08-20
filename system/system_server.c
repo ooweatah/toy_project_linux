@@ -14,6 +14,7 @@
 #include <web_server.h>
 #include <camera_HAL.h>
 #include <toy_message.h>
+#include <shared_memory.h>
 
 pthread_mutex_t system_loop_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  system_loop_cond  = PTHREAD_COND_INITIALIZER;
@@ -29,6 +30,9 @@ pthread_mutex_t toy_timer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static sem_t global_timer_sem;
 static bool global_timer_stopped;
 
+static shm_sensor_t *the_sensor_info = NULL;
+void set_periodic_timer(long sec_delay, long usec_delay);
+
 static void timer_expire_signal_handler()
 {
     // signal 문맥에서는 비동기 시그널 안전 함수(async-signal-safe function) 사용
@@ -43,7 +47,6 @@ static void system_timeout_handler()
     // 여기는 signal hander가 아니기 때문에 안전하게 mutex lock 사용 가능
     pthread_mutex_lock(&toy_timer_mutex);
     toy_timer++;
-    printf("toy_timer: %d\n", toy_timer);
     pthread_mutex_unlock(&toy_timer_mutex);
 }
 
@@ -53,8 +56,7 @@ static void *timer_thread(void *not_used)
     set_periodic_timer(1, 1);
 
 	while (!global_timer_stopped) {
-        // 아래 sleep을 sem_wait 함수를 사용하여 동기화 처리
-        int rc = sem_wait(&global_timer_sem);
+		int rc = sem_wait(&global_timer_sem);
 		if (rc == -1 && errno == EINTR) {
 		    continue;
 		}
@@ -62,13 +64,12 @@ static void *timer_thread(void *not_used)
 		if (rc == -1) {
 		    perror("sem_wait");
 		    exit(-1);
-        }
+		}
+        // 아래 sleep을 sem_wait 함수를 사용하여 동기화 처리
         // sleep(1);
 		system_timeout_handler();
-	
-	
-    }
-    return 0;
+	}
+	return 0;
 }
 
 void set_periodic_timer(long sec_delay, long usec_delay)
@@ -111,12 +112,14 @@ void *watchdog_thread(void* arg)
     return 0;
 }
 
+#define SENSOR_DATA 1
+
 void *monitor_thread(void* arg)
 {
     char *s = arg;
     int mqretcode;
     toy_msg_t msg;
-	int shmid;
+    int shmid;
 
     printf("%s", s);
 
@@ -127,18 +130,15 @@ void *monitor_thread(void* arg)
         printf("msg.type: %d\n", msg.msg_type);
         printf("msg.param1: %d\n", msg.param1);
         printf("msg.param2: %d\n", msg.param2);
-		if (msg.msg_type == SENSOR_DATA) {
-           shmid = msg.param1;
-           the_sensor_info = toy_shm_attach(shmid);
-           printf("sensor temp: %d\n", the_sensor_info->temp);
-           printf("sensor info: %d\n", the_sensor_info->press);
-           printf("sensor humidity: %d\n", the_sensor_info->humidity);
-           toy_shm_detach(the_sensor_info);
+        if (msg.msg_type == SENSOR_DATA) {
+            shmid = msg.param1;
+            the_sensor_info = toy_shm_attach(shmid);
+            printf("sensor temp: %d\n", the_sensor_info->temp);
+            printf("sensor info: %d\n", the_sensor_info->press);
+            printf("sensor humidity: %d\n", the_sensor_info->humidity);
+            toy_shm_detach(the_sensor_info);
         }
     }
-
-			i
-    
 
     return 0;
 }
@@ -207,7 +207,6 @@ void *camera_service_thread(void* arg)
 
 void signal_exit(void)
 {
-    /* 여기에 구현하세요..  종료 메시지를 보내도록.. */
     pthread_mutex_lock(&system_loop_mutex);
     system_loop_exit = true;
     pthread_cond_broadcast(&system_loop_cond);
