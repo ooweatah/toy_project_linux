@@ -14,6 +14,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <seccomp.h>
 
 #include <system_server.h>
 #include <gui.h>
@@ -22,10 +24,12 @@
 #include <execinfo.h>
 #include <toy_message.h>
 #include <shared_memory.h>
+#include <dump_state.h>
 
 #define TOY_TOK_BUFSIZE 64
 #define TOY_TOK_DELIM " \t\r\n\a"
 #define TOY_BUFFSIZE 1024
+#define DUMP_STATE 2
 
 typedef struct _sig_ucontext {
     unsigned long uc_flags;
@@ -54,7 +58,7 @@ void segfault_handler(int sig_num, siginfo_t * info, void * ucontext) {
   uc = (sig_ucontext_t *) ucontext;
 
   /* Get the address at the time the signal was raised */
-  caller_address = (void *) uc->uc_mcontext.rip;  // RIP: x86_64 specific     arm_pc: ARM
+  caller_address = (void *) uc->uc_mcontext.pc;  // RIP: x86_64 specific     arm_pc: ARM
 
   fprintf(stderr, "\n");
 
@@ -92,7 +96,7 @@ void *sensor_thread(void* arg)
     printf("%s", s);
 
     while (1) {
-        posix_sleep_ms(5000);
+        posix_sleep_ms(10000);
         // 현재 고도/온도/기압 정보를  SYS V shared memory에 저장 후
         // monitor thread에 메시지 전송한다.
         if (the_sensor_info != NULL) {
@@ -119,6 +123,10 @@ int toy_mutex(char **args);
 int toy_shell(char **args);
 int toy_message_queue(char **args);
 int toy_read_elf_header(char **args);
+int toy_dump_state(char **args);
+int toy_mincore(char **args);
+int toy_busy(char **args);
+int toy_simple_io(char **args);
 int toy_exit(char **args);
 
 char *builtin_str[] = {
@@ -127,6 +135,10 @@ char *builtin_str[] = {
     "sh",
     "mq",
     "elf",
+    "dump",
+    "mincore",
+    "busy",
+    "n",
     "exit"
 };
 
@@ -136,6 +148,10 @@ int (*builtin_func[]) (char **) = {
     &toy_shell,
     &toy_message_queue,
     &toy_read_elf_header,
+    &toy_dump_state,
+    &toy_mincore,
+    &toy_busy,
+    &toy_simple_io,
     &toy_exit
 };
 
@@ -199,6 +215,10 @@ int toy_read_elf_header(char **args)
         printf("cannot open ./sample/sample.elf\n");
         return 1;
     }
+    /* 여기서 mmap을 이용하여 파일 내용을 읽으세요.
+     * fread 사용 X
+     */
+
     if (!fstat(in_fd, &st)) {
         contents_sz = st.st_size;
         if (!contents_sz) {
@@ -208,7 +228,6 @@ int toy_read_elf_header(char **args)
         printf("real size: %ld\n", contents_sz);
         map = (Elf64Hdr *)mmap(NULL, contents_sz, PROT_READ, MAP_PRIVATE, in_fd, 0);
         printf("Object file type : %d\n", map->e_type);
-        printf("Object file version : %d\n", map->e_version); 
         printf("Architecture : %d\n", map->e_machine);
         printf("Object file version : %d\n", map->e_version);
         printf("Entry point virtual address : %ld\n", map->e_entry);
@@ -216,10 +235,75 @@ int toy_read_elf_header(char **args)
         munmap(map, contents_sz);
     }
 
+    return 1;
+}
+
+int toy_dump_state(char **args)
+{
+    int mqretcode;
+    toy_msg_t msg;
+
+    msg.msg_type = DUMP_STATE;
+    msg.param1 = 0;
+    msg.param2 = 0;
+    mqretcode = mq_send(camera_queue, (char *)&msg, sizeof(msg), 0);
+    assert(mqretcode == 0);
+    mqretcode = mq_send(monitor_queue, (char *)&msg, sizeof(msg), 0);
+    assert(mqretcode == 0);
 
     return 1;
 }
 
+int toy_mincore(char **args)
+{
+    unsigned char vec[20];
+    int res;
+    size_t page = sysconf(_SC_PAGESIZE);
+    void *addr = mmap(NULL, 20 * page, PROT_READ | PROT_WRITE,
+                    MAP_NORESERVE | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+    res = mincore(addr, 10 * page, vec);
+    assert(res == 0);
+
+    return 1;
+}
+
+int toy_busy(char **args)
+{
+    while (1)
+        ;
+    return 1;
+}
+
+int toy_simple_io(char **args)
+{
+    int dev;
+    char buff = 2;
+
+    dev = open("/dev/toy_simple_io_driver", O_RDWR | O_NDELAY);
+	if (dev < 0 ) {
+        printf("module open error\n");
+        return 1;
+    }
+
+    if (args[1] != NULL && !strcmp(args[1], "exit")) {
+        buff = 2;
+        if (write(dev, &buff, 1) < 0) {
+            printf("write error\n");
+            goto err;
+        }
+    } else {
+        buff = 1;
+        if (write(dev, &buff, 1) < 0) {
+            printf("write error\n");
+            goto err;
+        }
+    }
+
+err:
+    close(dev);
+
+    return 1;
+}
 
 int toy_exit(char **args)
 {
@@ -347,6 +431,7 @@ int input()
     struct sigaction sa;
     pthread_t command_thread_tid, sensor_thread_tid;
     int i;
+    scmp_filter_ctx ctx;
 
     printf("나 input 프로세스!\n");
 
@@ -357,6 +442,29 @@ int input()
     sa.sa_sigaction = segfault_handler;
 
     sigaction(SIGSEGV, &sa, NULL); /* ignore whether it works or not */
+
+    // 여기에 seccomp 을 이용해서 mincore 시스템 콜을 막아 주세요.
+    ctx = seccomp_init(SCMP_ACT_ALLOW);
+    if (ctx == NULL) {
+        printf("seccomp_init failed");
+        return -1;
+    }
+
+    int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(mincore), 0);
+    if (rc < 0) {
+        printf("seccomp_rule_add failed");
+        return -1;
+    }
+
+    seccomp_export_pfc(ctx, 5);
+    seccomp_export_bpf(ctx, 6);
+
+    rc = seccomp_load(ctx);
+    if (rc < 0) {
+        printf("seccomp_load failed");
+        return -1;
+    }
+    seccomp_release(ctx);
 
     /* 센서 정보를 공유하기 위한, 시스템 V 공유 메모리를 생성한다 */
     the_sensor_info = (shm_sensor_t *)toy_shm_create(SHM_KEY_SENSOR, sizeof(shm_sensor_t));

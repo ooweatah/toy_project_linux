@@ -16,6 +16,7 @@ static mqd_t watchdog_queue;
 static mqd_t monitor_queue;
 static mqd_t disk_queue;
 static mqd_t camera_queue;
+static mqd_t engine_queue;
 
 static void
 sigchldHandler(int sig)
@@ -95,6 +96,8 @@ int main()
     retcode = create_message_queue(&disk_queue, "/disk_queue", NUM_MESSAGES, sizeof(toy_msg_t));
     assert(retcode == 0);
     retcode = create_message_queue(&camera_queue, "/camera_queue", NUM_MESSAGES, sizeof(toy_msg_t));
+    assert(retcode == 0);
+    retcode = create_message_queue(&engine_queue, "/engine_queue", NUM_MESSAGES, sizeof(toy_msg_t));
     assert(retcode == 0);
 
     printf("시스템 서버를 생성합니다.\n");

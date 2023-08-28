@@ -7,14 +7,28 @@
 #include <sys/time.h>
 #include <time.h>
 #include <mqueue.h>
+#include <sys/inotify.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <sys/sysmacros.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <stdint.h>
+#include <string.h>
+#include <dirent.h>
 
 #include <system_server.h>
 #include <gui.h>
 #include <input.h>
 #include <web_server.h>
-#include <camera_HAL.h>
 #include <toy_message.h>
 #include <shared_memory.h>
+#include <dump_state.h>
+#include <hardware.h>
+
+#define BUF_LEN 1024
+#define TOY_TEST_FS "./fs"
 
 pthread_mutex_t system_loop_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  system_loop_cond  = PTHREAD_COND_INITIALIZER;
@@ -24,6 +38,7 @@ static mqd_t watchdog_queue;
 static mqd_t monitor_queue;
 static mqd_t disk_queue;
 static mqd_t camera_queue;
+static mqd_t engine_queue;
 
 static int toy_timer = 0;
 pthread_mutex_t toy_timer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -113,6 +128,7 @@ void *watchdog_thread(void* arg)
 }
 
 #define SENSOR_DATA 1
+#define DUMP_STATE 2
 
 void *monitor_thread(void* arg)
 {
@@ -137,42 +153,107 @@ void *monitor_thread(void* arg)
             printf("sensor info: %d\n", the_sensor_info->press);
             printf("sensor humidity: %d\n", the_sensor_info->humidity);
             toy_shm_detach(the_sensor_info);
+        } else if (msg.msg_type == DUMP_STATE) {
+            dumpstate();
+        } else {
+            printf("monitor_thread: unknown message. xxx\n");
         }
     }
 
     return 0;
 }
 
+// https://stackoverflow.com/questions/21618260/how-to-get-total-size-of-subdirectories-in-c
+static long get_directory_size(char *dirname)
+{
+    DIR *dir = opendir(dirname);
+    if (dir == 0)
+        return 0;
+
+    struct dirent *dit;
+    struct stat st;
+    long size = 0;
+    long total_size = 0;
+    char filePath[1024];
+
+    while ((dit = readdir(dir)) != NULL) {
+        if ( (strcmp(dit->d_name, ".") == 0) || (strcmp(dit->d_name, "..") == 0) )
+            continue;
+
+        sprintf(filePath, "%s/%s", dirname, dit->d_name);
+        if (lstat(filePath, &st) != 0)
+            continue;
+        size = st.st_size;
+
+        if (S_ISDIR(st.st_mode)) {
+            long dir_size = get_directory_size(filePath) + size;
+            total_size += dir_size;
+        } else {
+            total_size += size;
+        }
+    }
+    return total_size;
+}
+
+
 void *disk_service_thread(void* arg)
 {
     char *s = arg;
-    FILE* apipe;
-    char buf[1024];
-    char cmd[]="df -h ./" ;
+    int inotifyFd, wd, j;
+    char buf[BUF_LEN] __attribute__ ((aligned(8)));
+    ssize_t numRead;
+    char *p;
+    struct inotify_event *event;
+    char *directory = TOY_TEST_FS;
+    int total_size;
+
+    printf("%s", s);
+
+    inotifyFd = inotify_init();                 /* Create inotify instance */
+    if (inotifyFd == -1)
+        return 0;
+
+    wd = inotify_add_watch(inotifyFd, TOY_TEST_FS, IN_CREATE);
+    if (wd == -1)
+        return 0;
+
+    for (;;) {                                  /* Read events forever */
+        numRead = read(inotifyFd, buf, BUF_LEN);
+        if (numRead == 0) {
+            printf("read() from inotify fd returned 0!");
+            return 0;
+        }
+
+        if (numRead == -1)
+            return 0;
+
+        for (p = buf; p < buf + numRead; ) {
+            event = (struct inotify_event *) p;
+            p += sizeof(struct inotify_event) + event->len;
+        }
+        total_size = get_directory_size(TOY_TEST_FS);
+        printf("directory size: %d\n", total_size);
+    }
+
+    return 0;
+}
+
+void *engine_thread(void* arg)
+{
+    char *s = arg;
     int mqretcode;
     toy_msg_t msg;
+    int res;
 
     printf("%s", s);
 
     while (1) {
-        mqretcode = (int)mq_receive(disk_queue, (void *)&msg, sizeof(toy_msg_t), 0);
+        mqretcode = (int)mq_receive(engine_queue, (void *)&msg, sizeof(toy_msg_t), 0);
         assert(mqretcode >= 0);
-        printf("disk_service_thread: 메시지가 도착했습니다.\n");
+        printf("engine_service_thread: 메시지가 도착했습니다.\n");
         printf("msg.type: %d\n", msg.msg_type);
         printf("msg.param1: %d\n", msg.param1);
         printf("msg.param2: %d\n", msg.param2);
-
-        /* popen 사용하여 10초마다 disk 잔여량 출력
-         * popen으로 shell을 실행하면 성능과 보안 문제가 있음
-         * 향후 파일 관련 시스템 콜 시간에 개선,
-         * 하지만 가끔 빠르게 테스트 프로그램 또는 프로토 타입 시스템 작성 시 유용
-         */
-        apipe = popen(cmd, "r");
-        while (fgets( buf, 1024, apipe) ) {
-            printf("%s", buf);
-        }
-        pclose(apipe);
-
     }
 
     return 0;
@@ -185,10 +266,17 @@ void *camera_service_thread(void* arg)
     char *s = arg;
     int mqretcode;
     toy_msg_t msg;
+    hw_module_t *module = NULL;
+    int res;
 
     printf("%s", s);
 
-   toy_camera_open();
+    res = hw_get_camera_module((const hw_module_t **)&module);
+    assert(res == 0);
+    printf("Camera module name: %s\n", module->name);
+    printf("Camera module tag: %d\n", module->tag);
+    printf("Camera module id: %s\n", module->id);
+    module->open();
 
     while (1) {
         mqretcode = (int)mq_receive(camera_queue, (void *)&msg, sizeof(toy_msg_t), 0);
@@ -198,7 +286,11 @@ void *camera_service_thread(void* arg)
         printf("msg.param1: %d\n", msg.param1);
         printf("msg.param2: %d\n", msg.param2);
         if (msg.msg_type == CAMERA_TAKE_PICTURE) {
-            toy_camera_take_picture();
+            module->take_picture();
+        } else if (msg.msg_type == DUMP_STATE) {
+            module->dump();
+        } else {
+            printf("camera_service_thread: unknown message. xxx\n");
         }
     }
 
@@ -221,10 +313,12 @@ int system_server()
     timer_t *tidlist;
     int retcode;
     pthread_t watchdog_thread_tid, monitor_thread_tid, disk_service_thread_tid, camera_service_thread_tid;
-    pthread_t timer_thread_tid;
+    pthread_t timer_thread_tid, engine_thread_tid;
+    pthread_attr_t attr;
+    struct sched_param sched_param;
+    char short_thread_name[16] = "un-named";
 
     printf("나 system_server 프로세스!\n");
-
 
     /* 메시지 큐를 오픈한다. */
     watchdog_queue = mq_open("/watchdog_queue", O_RDWR);
@@ -235,6 +329,8 @@ int system_server()
     assert(disk_queue != -1);
     camera_queue = mq_open("/camera_queue", O_RDWR);
     assert(camera_queue != -1);
+    engine_queue = mq_open("/engine_queue", O_RDWR);
+    assert(engine_queue != -1);
 
     /* 스레드를 생성한다. */
     retcode = pthread_create(&watchdog_thread_tid, NULL, watchdog_thread, "watchdog thread\n");
@@ -246,6 +342,19 @@ int system_server()
     retcode = pthread_create(&camera_service_thread_tid, NULL, camera_service_thread, "camera service thread\n");
     assert(retcode == 0);
     retcode = pthread_create(&timer_thread_tid, NULL, timer_thread, "timer thread\n");
+    assert(retcode == 0);
+
+    // engine thread는 real-time class로 생성
+    retcode = pthread_attr_init(&attr);
+	assert(retcode == 0);
+    retcode = pthread_attr_setschedpolicy(&attr, SCHED_RR);
+	assert(retcode == 0);
+    retcode = pthread_attr_getschedparam( &attr, &sched_param );
+	assert(retcode == 0);
+    sched_param.sched_priority = 50;
+    retcode = pthread_attr_setschedparam( &attr, &sched_param );
+    assert(retcode == 0);
+    retcode = pthread_create(&engine_thread_tid, &attr, engine_thread, "engine thread\n");
     assert(retcode == 0);
 
     printf("system init done.  waiting...");

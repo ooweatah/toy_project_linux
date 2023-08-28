@@ -1,0 +1,1 @@
+cmd_/home/sslim/toy_project_linux/drivers/simple_io/simple_io.mod := { echo  /home/sslim/toy_project_linux/drivers/simple_io/simple_io.o;  echo; } > /home/sslim/toy_project_linux/drivers/simple_io/simple_io.mod
